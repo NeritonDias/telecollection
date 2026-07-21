@@ -69,7 +69,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
-      - run: go test ./internal/store/postgres/... ./internal/store/migrate/...
+      # -p 1 serializes the package test binaries: postgres/ and migrate/ share the
+      # same database, so running them in parallel raced on schema creation.
+      - run: go test -p 1 ./internal/store/postgres/... ./internal/store/migrate/...
         env:
           TELECOL_TEST_PG_DSN: postgres://tc:tc@localhost:5432/tc?sslmode=disable
 

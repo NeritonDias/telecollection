@@ -23,7 +23,7 @@ func TestUpPostgres_CreatesSchema(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if _, err := db.ExecContext(context.Background(), `DROP TABLE IF EXISTS folders, goose_db_version`); err != nil {
+	if _, err := db.ExecContext(context.Background(), `DROP TABLE IF EXISTS files, folders, goose_db_version CASCADE`); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
 	if err := UpPostgres(db); err != nil {
