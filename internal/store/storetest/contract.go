@@ -198,6 +198,100 @@ func Contract(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("CreateAndGetManifest", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		created, err := s.CreateManifest(ctx, store.ChunkManifest{
+			TotalSize:       9_000_000_000,
+			ChunkCount:      3,
+			ChunkMessageIDs: []int64{500, 501, 502},
+		})
+		if err != nil {
+			t.Fatalf("CreateManifest: %v", err)
+		}
+		if created.ID == 0 {
+			t.Fatal("CreateManifest must assign a non-zero ID")
+		}
+		if created.CreatedAt.IsZero() {
+			t.Fatal("CreateManifest must populate CreatedAt")
+		}
+		got, err := s.GetManifest(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("GetManifest: %v", err)
+		}
+		if got.TotalSize != 9_000_000_000 || got.ChunkCount != 3 {
+			t.Fatalf("GetManifest returned %+v, want total=9000000000 count=3", got)
+		}
+		want := []int64{500, 501, 502}
+		if len(got.ChunkMessageIDs) != len(want) {
+			t.Fatalf("ChunkMessageIDs = %v, want %v", got.ChunkMessageIDs, want)
+		}
+		for i := range want {
+			if got.ChunkMessageIDs[i] != want[i] {
+				t.Fatalf("ChunkMessageIDs[%d] = %d, want %d (order must be preserved)", i, got.ChunkMessageIDs[i], want[i])
+			}
+		}
+	})
+
+	t.Run("GetManifestNotFound", func(t *testing.T) {
+		s := newStore(t)
+		_, err := s.GetManifest(context.Background(), 424242)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("GetManifest(missing) error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("UpsertFilePreservesChunkManifestID", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		folder, err := s.CreateFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 10, Name: "F"})
+		if err != nil {
+			t.Fatalf("CreateFolder: %v", err)
+		}
+		manifest, err := s.CreateManifest(ctx, store.ChunkManifest{
+			TotalSize: 4_000_000_000, ChunkCount: 2, ChunkMessageIDs: []int64{9, 10},
+		})
+		if err != nil {
+			t.Fatalf("CreateManifest: %v", err)
+		}
+		// A chunked file carries the manifest id; it must round-trip.
+		created, err := s.UpsertFile(ctx, store.File{
+			FolderID: folder.ID, MessageID: 700, Name: "big.bin", Size: 4_000_000_000,
+			MIME: "application/octet-stream", ChunkManifestID: manifest.ID,
+		})
+		if err != nil {
+			t.Fatalf("UpsertFile: %v", err)
+		}
+		if created.ChunkManifestID != manifest.ID {
+			t.Fatalf("UpsertFile returned ChunkManifestID=%d, want %d", created.ChunkManifestID, manifest.ID)
+		}
+		got, err := s.GetFile(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("GetFile: %v", err)
+		}
+		if got.ChunkManifestID != manifest.ID {
+			t.Fatalf("GetFile returned ChunkManifestID=%d, want %d", got.ChunkManifestID, manifest.ID)
+		}
+
+		// A single-message file has no manifest: zero must round-trip (SQL NULL).
+		plain, err := s.UpsertFile(ctx, store.File{
+			FolderID: folder.ID, MessageID: 701, Name: "small.txt", Size: 5, MIME: "text/plain",
+		})
+		if err != nil {
+			t.Fatalf("UpsertFile(plain): %v", err)
+		}
+		if plain.ChunkManifestID != 0 {
+			t.Fatalf("plain file ChunkManifestID=%d, want 0", plain.ChunkManifestID)
+		}
+		gotPlain, err := s.GetFile(ctx, plain.ID)
+		if err != nil {
+			t.Fatalf("GetFile(plain): %v", err)
+		}
+		if gotPlain.ChunkManifestID != 0 {
+			t.Fatalf("GetFile(plain) ChunkManifestID=%d, want 0", gotPlain.ChunkManifestID)
+		}
+	})
+
 	t.Run("DeleteFile", func(t *testing.T) {
 		s := newStore(t)
 		ctx := context.Background()

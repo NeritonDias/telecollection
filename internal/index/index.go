@@ -43,6 +43,18 @@ func (i *Index) ListFiles(ctx context.Context, folderID int64) ([]store.File, er
 	return i.store.ListFiles(ctx, folderID)
 }
 
+// CreateManifest records a chunk manifest (Phase 3, large files) and returns it
+// with ID/CreatedAt populated. Delegated to the store; the chunk message ids are
+// serialized at the storage boundary.
+func (i *Index) CreateManifest(ctx context.Context, m store.ChunkManifest) (store.ChunkManifest, error) {
+	return i.store.CreateManifest(ctx, m)
+}
+
+// GetManifest returns the chunk manifest by ID, or store.ErrNotFound.
+func (i *Index) GetManifest(ctx context.Context, id int64) (store.ChunkManifest, error) {
+	return i.store.GetManifest(ctx, id)
+}
+
 // DeleteFile prunes the cached row for (folderID, msgID) so a subsequent
 // ListFiles no longer returns a file that has been deleted or moved on
 // Telegram. It resolves the row by scanning ListFiles(folderID) for a matching

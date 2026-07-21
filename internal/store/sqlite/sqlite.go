@@ -5,6 +5,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -119,13 +120,14 @@ func (s *Store) ListFolders(ctx context.Context, tgAccountID int64) ([]store.Fol
 // on update.
 func (s *Store) UpsertFile(ctx context.Context, f store.File) (store.File, error) {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO files (folder_id, message_id, name, size, mime)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO files (folder_id, message_id, name, size, mime, chunk_manifest_id)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(folder_id, message_id) DO UPDATE SET
 		   name = excluded.name,
 		   size = excluded.size,
-		   mime = excluded.mime`,
-		f.FolderID, f.MessageID, f.Name, f.Size, f.MIME)
+		   mime = excluded.mime,
+		   chunk_manifest_id = excluded.chunk_manifest_id`,
+		f.FolderID, f.MessageID, f.Name, f.Size, f.MIME, nullableID(f.ChunkManifestID))
 	if err != nil {
 		return store.File{}, fmt.Errorf("sqlite: upsert file: %w", err)
 	}
@@ -146,16 +148,18 @@ func (s *Store) GetFile(ctx context.Context, id int64) (store.File, error) {
 	var (
 		f       store.File
 		created string
+		chunkID sql.NullInt64
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, folder_id, message_id, name, size, mime, created_at FROM files WHERE id = ?`, id).
-		Scan(&f.ID, &f.FolderID, &f.MessageID, &f.Name, &f.Size, &f.MIME, &created)
+		`SELECT id, folder_id, message_id, name, size, mime, chunk_manifest_id, created_at FROM files WHERE id = ?`, id).
+		Scan(&f.ID, &f.FolderID, &f.MessageID, &f.Name, &f.Size, &f.MIME, &chunkID, &created)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return store.File{}, store.ErrNotFound
 	case err != nil:
 		return store.File{}, fmt.Errorf("sqlite: get file: %w", err)
 	}
+	f.ChunkManifestID = chunkID.Int64
 	f.CreatedAt = parseTime(created)
 	return f, nil
 }
@@ -163,7 +167,7 @@ func (s *Store) GetFile(ctx context.Context, id int64) (store.File, error) {
 // ListFiles returns files for a folder, ordered by ID.
 func (s *Store) ListFiles(ctx context.Context, folderID int64) ([]store.File, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, folder_id, message_id, name, size, mime, created_at FROM files WHERE folder_id = ? ORDER BY id`,
+		`SELECT id, folder_id, message_id, name, size, mime, chunk_manifest_id, created_at FROM files WHERE folder_id = ? ORDER BY id`,
 		folderID)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: list files: %w", err)
@@ -175,10 +179,12 @@ func (s *Store) ListFiles(ctx context.Context, folderID int64) ([]store.File, er
 		var (
 			f       store.File
 			created string
+			chunkID sql.NullInt64
 		)
-		if err := rows.Scan(&f.ID, &f.FolderID, &f.MessageID, &f.Name, &f.Size, &f.MIME, &created); err != nil {
+		if err := rows.Scan(&f.ID, &f.FolderID, &f.MessageID, &f.Name, &f.Size, &f.MIME, &chunkID, &created); err != nil {
 			return nil, fmt.Errorf("sqlite: scan file: %w", err)
 		}
+		f.ChunkManifestID = chunkID.Int64
 		f.CreatedAt = parseTime(created)
 		out = append(out, f)
 	}
@@ -204,6 +210,51 @@ func (s *Store) DeleteFile(ctx context.Context, id int64) error {
 	return nil
 }
 
+// CreateManifest inserts a chunk manifest and returns it with ID/CreatedAt
+// populated. ChunkMessageIDs is serialized as a JSON array of int64.
+func (s *Store) CreateManifest(ctx context.Context, m store.ChunkManifest) (store.ChunkManifest, error) {
+	ids, err := marshalIDs(m.ChunkMessageIDs)
+	if err != nil {
+		return store.ChunkManifest{}, err
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO chunk_manifests (total_size, chunk_count, chunk_message_ids)
+		 VALUES (?, ?, ?)`,
+		m.TotalSize, m.ChunkCount, ids)
+	if err != nil {
+		return store.ChunkManifest{}, fmt.Errorf("sqlite: insert manifest: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return store.ChunkManifest{}, fmt.Errorf("sqlite: manifest last insert id: %w", err)
+	}
+	return s.GetManifest(ctx, id)
+}
+
+// GetManifest returns the manifest by ID or store.ErrNotFound. The stored JSON
+// array is deserialized back into ChunkMessageIDs.
+func (s *Store) GetManifest(ctx context.Context, id int64) (store.ChunkManifest, error) {
+	var (
+		m       store.ChunkManifest
+		ids     string
+		created string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, total_size, chunk_count, chunk_message_ids, created_at FROM chunk_manifests WHERE id = ?`, id).
+		Scan(&m.ID, &m.TotalSize, &m.ChunkCount, &ids, &created)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return store.ChunkManifest{}, store.ErrNotFound
+	case err != nil:
+		return store.ChunkManifest{}, fmt.Errorf("sqlite: get manifest: %w", err)
+	}
+	if m.ChunkMessageIDs, err = unmarshalIDs(ids); err != nil {
+		return store.ChunkManifest{}, err
+	}
+	m.CreatedAt = parseTime(created)
+	return m, nil
+}
+
 // Close releases the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
 
@@ -213,4 +264,32 @@ func parseTime(s string) time.Time {
 		return time.Time{}
 	}
 	return t
+}
+
+// nullableID maps a zero id to SQL NULL and any other value to itself, so a
+// file without a manifest stores NULL in chunk_manifest_id.
+func nullableID(id int64) sql.NullInt64 {
+	return sql.NullInt64{Int64: id, Valid: id != 0}
+}
+
+// marshalIDs serializes chunk message ids as a JSON array of int64. A nil slice
+// is stored as an empty array so the column is never NULL.
+func marshalIDs(ids []int64) (string, error) {
+	if ids == nil {
+		ids = []int64{}
+	}
+	b, err := json.Marshal(ids)
+	if err != nil {
+		return "", fmt.Errorf("sqlite: marshal chunk ids: %w", err)
+	}
+	return string(b), nil
+}
+
+// unmarshalIDs parses the JSON array produced by marshalIDs.
+func unmarshalIDs(s string) ([]int64, error) {
+	var ids []int64
+	if err := json.Unmarshal([]byte(s), &ids); err != nil {
+		return nil, fmt.Errorf("sqlite: unmarshal chunk ids: %w", err)
+	}
+	return ids, nil
 }

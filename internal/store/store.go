@@ -40,6 +40,14 @@ type Store interface {
 	// DeleteFile removes a file by ID, or returns ErrNotFound.
 	DeleteFile(ctx context.Context, id int64) error
 
+	// CreateManifest inserts a chunk manifest and returns it with ID/CreatedAt
+	// populated. ChunkMessageIDs is serialized as a JSON array of int64 at the
+	// storage boundary and its order is preserved.
+	CreateManifest(ctx context.Context, m ChunkManifest) (ChunkManifest, error)
+	// GetManifest returns the manifest by ID, or ErrNotFound. The stored JSON
+	// array is deserialized back into ChunkMessageIDs.
+	GetManifest(ctx context.Context, id int64) (ChunkManifest, error)
+
 	// Close releases underlying resources.
 	Close() error
 }

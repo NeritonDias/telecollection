@@ -110,6 +110,34 @@ func TestIndex_DeleteFilePrunesRow(t *testing.T) {
 	}
 }
 
+func TestIndex_ManifestRoundtrip(t *testing.T) {
+	idx := newIndex(t)
+	ctx := context.Background()
+
+	created, err := idx.CreateManifest(ctx, store.ChunkManifest{
+		TotalSize: 9_000_000_000, ChunkCount: 3, ChunkMessageIDs: []int64{11, 12, 13},
+	})
+	if err != nil {
+		t.Fatalf("CreateManifest: %v", err)
+	}
+	if created.ID == 0 {
+		t.Fatal("CreateManifest must assign a non-zero ID")
+	}
+
+	got, err := idx.GetManifest(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetManifest: %v", err)
+	}
+	if got.ChunkCount != 3 || len(got.ChunkMessageIDs) != 3 {
+		t.Fatalf("GetManifest = %+v, want count=3 with 3 ids", got)
+	}
+	for i, want := range []int64{11, 12, 13} {
+		if got.ChunkMessageIDs[i] != want {
+			t.Fatalf("ChunkMessageIDs[%d] = %d, want %d", i, got.ChunkMessageIDs[i], want)
+		}
+	}
+}
+
 func TestIndex_UpsertFileDedupes(t *testing.T) {
 	idx := newIndex(t)
 	ctx := context.Background()

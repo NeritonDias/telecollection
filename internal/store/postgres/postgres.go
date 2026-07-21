@@ -4,6 +4,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -115,42 +116,51 @@ func (s *Store) ListFolders(ctx context.Context, tgAccountID int64) ([]store.Fol
 // (folder_id, message_id), returning it fully populated. CreatedAt is preserved
 // on update.
 func (s *Store) UpsertFile(ctx context.Context, f store.File) (store.File, error) {
-	var out store.File
+	var (
+		out     store.File
+		chunkID sql.NullInt64
+	)
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO files (folder_id, message_id, name, size, mime)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO files (folder_id, message_id, name, size, mime, chunk_manifest_id)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT (folder_id, message_id) DO UPDATE SET
 		   name = EXCLUDED.name,
 		   size = EXCLUDED.size,
-		   mime = EXCLUDED.mime
-		 RETURNING id, folder_id, message_id, name, size, mime, created_at`,
-		f.FolderID, f.MessageID, f.Name, f.Size, f.MIME).
-		Scan(&out.ID, &out.FolderID, &out.MessageID, &out.Name, &out.Size, &out.MIME, &out.CreatedAt)
+		   mime = EXCLUDED.mime,
+		   chunk_manifest_id = EXCLUDED.chunk_manifest_id
+		 RETURNING id, folder_id, message_id, name, size, mime, chunk_manifest_id, created_at`,
+		f.FolderID, f.MessageID, f.Name, f.Size, f.MIME, nullableID(f.ChunkManifestID)).
+		Scan(&out.ID, &out.FolderID, &out.MessageID, &out.Name, &out.Size, &out.MIME, &chunkID, &out.CreatedAt)
 	if err != nil {
 		return store.File{}, fmt.Errorf("postgres: upsert file: %w", err)
 	}
+	out.ChunkManifestID = chunkID.Int64
 	return out, nil
 }
 
 // GetFile returns the file by ID or store.ErrNotFound.
 func (s *Store) GetFile(ctx context.Context, id int64) (store.File, error) {
-	var f store.File
+	var (
+		f       store.File
+		chunkID sql.NullInt64
+	)
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, folder_id, message_id, name, size, mime, created_at FROM files WHERE id = $1`, id).
-		Scan(&f.ID, &f.FolderID, &f.MessageID, &f.Name, &f.Size, &f.MIME, &f.CreatedAt)
+		`SELECT id, folder_id, message_id, name, size, mime, chunk_manifest_id, created_at FROM files WHERE id = $1`, id).
+		Scan(&f.ID, &f.FolderID, &f.MessageID, &f.Name, &f.Size, &f.MIME, &chunkID, &f.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.File{}, store.ErrNotFound
 	}
 	if err != nil {
 		return store.File{}, fmt.Errorf("postgres: get file: %w", err)
 	}
+	f.ChunkManifestID = chunkID.Int64
 	return f, nil
 }
 
 // ListFiles returns files for a folder, ordered by ID.
 func (s *Store) ListFiles(ctx context.Context, folderID int64) ([]store.File, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, folder_id, message_id, name, size, mime, created_at FROM files WHERE folder_id = $1 ORDER BY id`,
+		`SELECT id, folder_id, message_id, name, size, mime, chunk_manifest_id, created_at FROM files WHERE folder_id = $1 ORDER BY id`,
 		folderID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list files: %w", err)
@@ -159,10 +169,14 @@ func (s *Store) ListFiles(ctx context.Context, folderID int64) ([]store.File, er
 
 	var out []store.File
 	for rows.Next() {
-		var f store.File
-		if err := rows.Scan(&f.ID, &f.FolderID, &f.MessageID, &f.Name, &f.Size, &f.MIME, &f.CreatedAt); err != nil {
+		var (
+			f       store.File
+			chunkID sql.NullInt64
+		)
+		if err := rows.Scan(&f.ID, &f.FolderID, &f.MessageID, &f.Name, &f.Size, &f.MIME, &chunkID, &f.CreatedAt); err != nil {
 			return nil, fmt.Errorf("postgres: scan file: %w", err)
 		}
+		f.ChunkManifestID = chunkID.Int64
 		out = append(out, f)
 	}
 	if err := rows.Err(); err != nil {
@@ -183,8 +197,84 @@ func (s *Store) DeleteFile(ctx context.Context, id int64) error {
 	return nil
 }
 
+// CreateManifest inserts a chunk manifest and returns it with ID/CreatedAt
+// populated. ChunkMessageIDs is serialized as a JSON array of int64.
+func (s *Store) CreateManifest(ctx context.Context, m store.ChunkManifest) (store.ChunkManifest, error) {
+	ids, err := marshalIDs(m.ChunkMessageIDs)
+	if err != nil {
+		return store.ChunkManifest{}, err
+	}
+	var (
+		out    store.ChunkManifest
+		stored string
+	)
+	err = s.pool.QueryRow(ctx,
+		`INSERT INTO chunk_manifests (total_size, chunk_count, chunk_message_ids)
+		 VALUES ($1, $2, $3)
+		 RETURNING id, total_size, chunk_count, chunk_message_ids, created_at`,
+		m.TotalSize, m.ChunkCount, ids).
+		Scan(&out.ID, &out.TotalSize, &out.ChunkCount, &stored, &out.CreatedAt)
+	if err != nil {
+		return store.ChunkManifest{}, fmt.Errorf("postgres: insert manifest: %w", err)
+	}
+	if out.ChunkMessageIDs, err = unmarshalIDs(stored); err != nil {
+		return store.ChunkManifest{}, err
+	}
+	return out, nil
+}
+
+// GetManifest returns the manifest by ID or store.ErrNotFound. The stored JSON
+// array is deserialized back into ChunkMessageIDs.
+func (s *Store) GetManifest(ctx context.Context, id int64) (store.ChunkManifest, error) {
+	var (
+		m      store.ChunkManifest
+		stored string
+	)
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, total_size, chunk_count, chunk_message_ids, created_at FROM chunk_manifests WHERE id = $1`, id).
+		Scan(&m.ID, &m.TotalSize, &m.ChunkCount, &stored, &m.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.ChunkManifest{}, store.ErrNotFound
+	}
+	if err != nil {
+		return store.ChunkManifest{}, fmt.Errorf("postgres: get manifest: %w", err)
+	}
+	if m.ChunkMessageIDs, err = unmarshalIDs(stored); err != nil {
+		return store.ChunkManifest{}, err
+	}
+	return m, nil
+}
+
 // Close releases the pool.
 func (s *Store) Close() error {
 	s.pool.Close()
 	return nil
+}
+
+// nullableID maps a zero id to SQL NULL and any other value to itself, so a
+// file without a manifest stores NULL in chunk_manifest_id.
+func nullableID(id int64) sql.NullInt64 {
+	return sql.NullInt64{Int64: id, Valid: id != 0}
+}
+
+// marshalIDs serializes chunk message ids as a JSON array of int64. A nil slice
+// is stored as an empty array so the column is never NULL.
+func marshalIDs(ids []int64) (string, error) {
+	if ids == nil {
+		ids = []int64{}
+	}
+	b, err := json.Marshal(ids)
+	if err != nil {
+		return "", fmt.Errorf("postgres: marshal chunk ids: %w", err)
+	}
+	return string(b), nil
+}
+
+// unmarshalIDs parses the JSON array produced by marshalIDs.
+func unmarshalIDs(s string) ([]int64, error) {
+	var ids []int64
+	if err := json.Unmarshal([]byte(s), &ids); err != nil {
+		return nil, fmt.Errorf("postgres: unmarshal chunk ids: %w", err)
+	}
+	return ids, nil
 }
