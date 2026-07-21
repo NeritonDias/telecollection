@@ -17,6 +17,8 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
+	tgauth "github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/auth/qrlogin"
 	"github.com/gotd/td/tg"
 
 	"github.com/telecollection/telecollection/internal/telegram/retry"
@@ -117,6 +119,17 @@ func (c *Client) Run(ctx context.Context, f func(ctx context.Context) error) err
 // dispatcher the client invokes, so registrations take effect immediately.
 func (c *Client) Dispatcher() tg.UpdateDispatcher {
 	return c.dispatcher
+}
+
+// Auth exposes gotd's auth client for driving the login flow (code/2FA).
+// It is only valid while the client is connected — i.e. called inside Run.
+func (c *Client) Auth() *tgauth.Client {
+	return c.tg.Auth()
+}
+
+// QR exposes gotd's QR login helper. Only valid inside Run.
+func (c *Client) QR() qrlogin.QR {
+	return c.tg.QR()
 }
 
 // floodWaitMiddleware is a telegram.Middleware that transparently honours
