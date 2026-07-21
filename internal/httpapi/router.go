@@ -4,12 +4,14 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/telecollection/telecollection/internal/telegram/auth"
 )
 
 // Deps configures the router.
 type Deps struct {
-	APIKeyHashHex  string   // sha256 hex of the local API key; empty disables the API (fails closed)
-	AllowedOrigins []string // exact-match CORS origins (e.g. "wails://wails", "http://localhost:1420")
+	APIKeyHashHex  string       // sha256 hex of the local API key; empty disables the API (fails closed)
+	AllowedOrigins []string     // exact-match CORS origins (e.g. "wails://wails", "http://localhost:1420")
+	Auth           auth.Service // Telegram login flow; when nil the auth endpoints are not mounted
 }
 
 // NewRouter builds the HTTP handler shared by desktop and server modes.
@@ -27,6 +29,9 @@ func NewRouter(d Deps) http.Handler {
 			_, _ = w.Write([]byte(`{"pong":true}`))
 		})
 		r.Get("/events", sse) // SSE scaffold; real event bus arrives with transfers
+		if d.Auth != nil {
+			RegisterAuthRoutes(r, d.Auth)
+		}
 	})
 
 	return r
