@@ -256,6 +256,78 @@ func TestDownloadToValidatesInput(t *testing.T) {
 	}
 }
 
+// nonSeekable wraps an io.Reader so it does NOT satisfy io.Seeker, modelling a
+// streaming body (e.g. an HTTP multipart part) that cannot be rewound.
+type nonSeekable struct{ r io.Reader }
+
+func (n nonSeekable) Read(p []byte) (int, error) { return n.r.Read(p) }
+
+// TestUploadWithRetry_NonSeekableReaderNotReused proves that when the body
+// cannot be rewound, a failed upload is NOT re-driven: doing so would resume
+// from a consumed reader and could upload a truncated/empty body as a false
+// success. The operation must instead fail after a single attempt.
+func TestUploadWithRetry_NonSeekableReaderNotReused(t *testing.T) {
+	ctx := context.Background()
+	payload := makePayload(32)
+	r := nonSeekable{bytes.NewReader(payload)}
+
+	calls := 0
+	_, err := uploadWithRetry(ctx, "f", r, int64(len(payload)), nil, func(body io.Reader) (tg.InputFileClass, error) {
+		calls++
+		// The uploader drains the body before the RPC surfaces its failure,
+		// exhausting a non-seekable reader.
+		_, _ = io.Copy(io.Discard, body)
+		return nil, errors.New("transient boom")
+	})
+
+	if err == nil {
+		t.Fatal("want failure, got nil: a non-rewindable retry must not report a truncated upload as success")
+	}
+	if calls != 1 {
+		t.Fatalf("upload attempted %d times, want exactly 1 (non-seekable reader must not be re-driven)", calls)
+	}
+}
+
+// TestUploadWithRetry_SeekableReaderRewoundOnRetry proves that a seekable body
+// is rewound to the start before a retry, so the re-driven attempt re-sends the
+// full stream instead of resuming from a consumed position.
+func TestUploadWithRetry_SeekableReaderRewoundOnRetry(t *testing.T) {
+	// Shrink the backoff so the single inter-attempt wait is negligible.
+	orig := transferPolicy
+	transferPolicy.Base = time.Millisecond
+	transferPolicy.Max = 2 * time.Millisecond
+	t.Cleanup(func() { transferPolicy = orig })
+
+	ctx := context.Background()
+	payload := makePayload(48)
+	r := bytes.NewReader(payload) // *bytes.Reader implements io.Seeker
+
+	calls := 0
+	var lastRead []byte
+	f, err := uploadWithRetry(ctx, "f", r, int64(len(payload)), nil, func(body io.Reader) (tg.InputFileClass, error) {
+		calls++
+		b, _ := io.ReadAll(body)
+		lastRead = b
+		if calls < 2 {
+			return nil, errors.New("transient boom")
+		}
+		return &tg.InputFile{}, nil
+	})
+
+	if err != nil {
+		t.Fatalf("want success after a rewound retry, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("upload attempted %d times, want 2", calls)
+	}
+	if !bytes.Equal(lastRead, payload) {
+		t.Fatalf("retried attempt read %d bytes, want the full %d (reader was not rewound)", len(lastRead), len(payload))
+	}
+	if f == nil {
+		t.Fatal("want non-nil InputFile on success")
+	}
+}
+
 // TestUploadDownloadRoundTripE2E exercises the real network path against a live,
 // authenticated Telegram session. It is skipped unless TELECOL_TEST_TG=1, since
 // UploadBytes/DownloadTo require a connected *tg.Client. It exists to keep the

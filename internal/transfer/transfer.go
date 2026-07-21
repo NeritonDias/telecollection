@@ -51,14 +51,21 @@ var transferPolicy = retry.Policy{
 // UploadBytes uploads exactly size bytes read from r and returns the resulting
 // gotd InputFile, ready to be attached to a message. Progress is reported as
 // bytes are read, with a final report where Done == Total. Cancellation is
-// honoured through ctx, and whole-operation transient failures are retried via
-// retry.Do.
+// honoured through ctx.
 //
-// Caveat: r is consumed as it is read. A retry re-invokes the RPC, but a
-// non-seekable reader cannot be rewound, so a retry after r has been partially
-// consumed will not re-send earlier bytes. The dominant transient case
-// (FLOOD_WAIT and per-part failures) is handled inside gotd before r is
-// exhausted; the outer retry guards failures raised before the stream is read.
+// The whole-operation retry policy adapts to r's rewindability, so a retry never
+// re-drives a reader it cannot rewind:
+//
+//   - If r implements io.Seeker, each retry seeks it back to the start before
+//     re-sending, so a re-driven attempt transmits the full stream.
+//   - If r does NOT implement io.Seeker, the upload runs with a single attempt
+//     (no whole-operation retry). Re-driving an exhausted, non-seekable reader
+//     would resume from a partially-consumed position and could upload a
+//     truncated or empty body as a false success, so it is disabled by design.
+//
+// Either way, the dominant transient cases (FLOOD_WAIT and per-part failures)
+// are still handled inside gotd's uploader, below the RPC boundary, before r is
+// exhausted.
 func UploadBytes(ctx context.Context, api *tg.Client, name string, r io.Reader, size int64, onProgress func(Progress)) (tg.InputFileClass, error) {
 	if api == nil {
 		return nil, errors.New("transfer: api client is required")
@@ -70,13 +77,32 @@ func UploadBytes(ctx context.Context, api *tg.Client, name string, r io.Reader, 
 		return nil, fmt.Errorf("transfer: size must be non-negative, got %d", size)
 	}
 
-	pr := newProgressReader(ctx, r, size, onProgress)
 	up := uploader.NewUploader(api)
+	return uploadWithRetry(ctx, name, r, size, onProgress, func(body io.Reader) (tg.InputFileClass, error) {
+		return up.Upload(ctx, uploader.NewUpload(name, body, size))
+	})
+}
+
+// uploadWithRetry drives do under the whole-operation retry policy, feeding it a
+// progress-tracking reader over r. It centralises the rewind-safety rule
+// documented on UploadBytes: a seekable r is rewound before each retry, while a
+// non-seekable r is capped to a single attempt so an exhausted reader is never
+// re-driven into a truncated/empty upload. It is unexported so the retry/reset
+// behaviour can be exercised offline with a fake do, without a live client.
+func uploadWithRetry(ctx context.Context, name string, r io.Reader, size int64, onProgress func(Progress), do func(body io.Reader) (tg.InputFileClass, error)) (tg.InputFileClass, error) {
+	pr := newProgressReader(ctx, r, size, onProgress)
+
+	policy := transferPolicy
+	if _, ok := r.(io.Seeker); !ok {
+		policy.MaxAttempts = 1
+	}
 
 	var result tg.InputFileClass
-	err := retry.Do(ctx, transferPolicy, func() error {
-		pr.reset()
-		f, upErr := up.Upload(ctx, uploader.NewUpload(name, pr, size))
+	err := retry.Do(ctx, policy, func() error {
+		if err := pr.reset(); err != nil {
+			return err
+		}
+		f, upErr := do(pr)
 		if upErr != nil {
 			return upErr
 		}
@@ -139,20 +165,38 @@ func DownloadTo(ctx context.Context, api *tg.Client, loc tg.InputFileLocationCla
 type progressReader struct {
 	ctx        context.Context
 	r          io.Reader
+	seeker     io.Seeker // non-nil when r can be rewound for a retry
 	total      int64
 	done       int64
 	onProgress func(Progress)
 	finalSent  bool
+	started    bool // set after the first reset; guards the retry rewind
 }
 
 func newProgressReader(ctx context.Context, r io.Reader, total int64, onProgress func(Progress)) *progressReader {
-	return &progressReader{ctx: ctx, r: r, total: total, onProgress: onProgress}
+	pr := &progressReader{ctx: ctx, r: r, total: total, onProgress: onProgress}
+	if s, ok := r.(io.Seeker); ok {
+		pr.seeker = s
+	}
+	return pr
 }
 
-// reset zeroes the byte counter so a retried attempt reports fresh progress.
-func (pr *progressReader) reset() {
+// reset prepares the reader for an attempt, zeroing the byte counter so progress
+// is reported fresh. On a retry (any reset after the first) it rewinds a
+// seekable underlying reader to the start so the re-driven attempt re-sends the
+// full stream; a rewind failure is returned so the caller aborts instead of
+// uploading a partial body. A non-seekable reader is never rewound here (the
+// caller caps such uploads to a single attempt).
+func (pr *progressReader) reset() error {
+	if pr.started && pr.seeker != nil {
+		if _, err := pr.seeker.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("transfer: rewinding reader for retry: %w", err)
+		}
+	}
+	pr.started = true
 	pr.done = 0
 	pr.finalSent = false
+	return nil
 }
 
 func (pr *progressReader) Read(p []byte) (int, error) {

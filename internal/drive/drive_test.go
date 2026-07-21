@@ -35,6 +35,16 @@ func (c *fakeConn) WithAPI(ctx context.Context, fn func(ctx context.Context, api
 	return fn(ctx, c.api)
 }
 
+// okConn is a Conn double whose WithAPI reports a successful network operation
+// without invoking fn. It lets tests exercise the post-network index bookkeeping
+// (pruning/reindexing) that only runs once the Telegram call has succeeded,
+// which the nil-client fakeConn cannot reach.
+type okConn struct{}
+
+func (okConn) WithAPI(_ context.Context, _ func(ctx context.Context, api *tg.Client) error) error {
+	return nil
+}
+
 func newIndex(t *testing.T) *index.Index {
 	t.Helper()
 	p := filepath.ToSlash(filepath.Join(t.TempDir(), "t.db"))
@@ -287,6 +297,50 @@ func TestReindexMovedFile(t *testing.T) {
 	}
 	if len(dstFiles) != 1 || dstFiles[0].MessageID != 42 || dstFiles[0].Name != "m.bin" || dstFiles[0].Size != 11 {
 		t.Fatalf("move not reflected in dst: %+v", dstFiles)
+	}
+
+	// The origin must be pruned so ListFiles on src no longer serves the moved
+	// file (stale-index fix).
+	srcFiles, err := idx.ListFiles(ctx, srcFid.ID)
+	if err != nil {
+		t.Fatalf("ListFiles src: %v", err)
+	}
+	if len(srcFiles) != 0 {
+		t.Fatalf("source not pruned after move: %+v", srcFiles)
+	}
+}
+
+// TestDeleteFile_PrunesIndex proves that after a successful delete the cached
+// row is pruned, so ListFiles no longer returns the deleted file.
+func TestDeleteFile_PrunesIndex(t *testing.T) {
+	ctx := context.Background()
+	idx := newIndex(t)
+	svc := New(okConn{}, idx).(*driveService)
+	folder := sampleFolder()
+
+	fid, err := svc.ensureFolder(ctx, folder)
+	if err != nil {
+		t.Fatalf("ensureFolder: %v", err)
+	}
+	if _, err := idx.UpsertFile(ctx, store.File{FolderID: fid.ID, MessageID: 5, Name: "a.txt", Size: 3, MIME: "text/plain"}); err != nil {
+		t.Fatalf("seed UpsertFile: %v", err)
+	}
+
+	// Sanity: the file is listed before the delete.
+	if files, err := svc.ListFiles(ctx, folder); err != nil || len(files) != 1 {
+		t.Fatalf("pre-delete ListFiles = %+v (err %v), want exactly one file", files, err)
+	}
+
+	if err := svc.DeleteFile(ctx, folder, 5); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+
+	files, err := svc.ListFiles(ctx, folder)
+	if err != nil {
+		t.Fatalf("post-delete ListFiles: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("stale index: ListFiles after delete = %+v, want empty", files)
 	}
 }
 

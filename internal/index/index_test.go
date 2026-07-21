@@ -78,6 +78,38 @@ func TestIndex_FileRoundtripAndFilter(t *testing.T) {
 	}
 }
 
+func TestIndex_DeleteFilePrunesRow(t *testing.T) {
+	idx := newIndex(t)
+	ctx := context.Background()
+
+	folder, err := idx.UpsertFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 100, Name: "Docs"})
+	if err != nil {
+		t.Fatalf("UpsertFolder: %v", err)
+	}
+	if _, err := idx.UpsertFile(ctx, store.File{
+		FolderID: folder.ID, MessageID: 5, Name: "a.pdf", Size: 10, MIME: "application/pdf",
+	}); err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+
+	// Deleting the cached message must remove it from ListFiles.
+	if err := idx.DeleteFile(ctx, folder.ID, 5); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	got, err := idx.ListFiles(ctx, folder.ID)
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListFiles after delete = %+v, want empty", got)
+	}
+
+	// Deleting a message that is not cached is an idempotent no-op success.
+	if err := idx.DeleteFile(ctx, folder.ID, 999); err != nil {
+		t.Fatalf("DeleteFile miss should be no-op: %v", err)
+	}
+}
+
 func TestIndex_UpsertFileDedupes(t *testing.T) {
 	idx := newIndex(t)
 	ctx := context.Background()

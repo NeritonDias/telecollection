@@ -364,10 +364,31 @@ func TestDownloadFile_SanitizesFilename(t *testing.T) {
 
 func TestDownloadFile_BusinessErrorReturns500(t *testing.T) {
 	f := &fakeDrive{err: context.DeadlineExceeded}
-	rec := doJSON(t, mountDrive(f), http.MethodGet, "/files/download?channel_id=1&access_hash=2&msg_id=1", "")
+	rec := doJSON(t, mountDrive(f), http.MethodGet, "/files/download?channel_id=1&access_hash=2&msg_id=1&name=report.pdf", "")
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("code = %d, want 500 (body %q)", rec.Code, rec.Body.String())
+	}
+	// A download that fails before the first byte must not emit an orphaned
+	// attachment header on the JSON error response.
+	if cd := rec.Header().Get("Content-Disposition"); cd != "" {
+		t.Fatalf("500 error carries orphaned Content-Disposition: %q", cd)
+	}
+	// The error envelope must be JSON, not an octet-stream attachment.
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("error Content-Type = %q, want application/json", ct)
+	}
+	var out struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode error body %q: %v", rec.Body.String(), err)
+	}
+	if out.Error.Code == "" || out.Error.Message == "" {
+		t.Fatalf("error envelope incomplete: %q", rec.Body.String())
 	}
 }
 

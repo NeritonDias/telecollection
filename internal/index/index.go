@@ -6,6 +6,7 @@ package index
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/telecollection/telecollection/internal/store"
 )
@@ -40,4 +41,28 @@ func (i *Index) UpsertFile(ctx context.Context, f store.File) (store.File, error
 // ListFiles returns cached files for a folder.
 func (i *Index) ListFiles(ctx context.Context, folderID int64) ([]store.File, error) {
 	return i.store.ListFiles(ctx, folderID)
+}
+
+// DeleteFile prunes the cached row for (folderID, msgID) so a subsequent
+// ListFiles no longer returns a file that has been deleted or moved on
+// Telegram. It resolves the row by scanning ListFiles(folderID) for a matching
+// MessageID, then deletes it by primary key.
+//
+// A message that is not cached is a no-op success (idempotent): the index is a
+// disposable acceleration layer, not an authority, so pruning something already
+// absent is not an error.
+func (i *Index) DeleteFile(ctx context.Context, folderID, msgID int64) error {
+	files, err := i.store.ListFiles(ctx, folderID)
+	if err != nil {
+		return fmt.Errorf("index: listing files to delete: %w", err)
+	}
+	for _, f := range files {
+		if f.MessageID == msgID {
+			if err := i.store.DeleteFile(ctx, f.ID); err != nil {
+				return fmt.Errorf("index: deleting file: %w", err)
+			}
+			return nil
+		}
+	}
+	return nil
 }

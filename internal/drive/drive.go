@@ -192,17 +192,24 @@ func (s *driveService) RenameFile(ctx context.Context, folder dialogs.Folder, ms
 	return nil
 }
 
-// DeleteFile removes a file's message via fileops.Delete.
-//
-// The index exposes no file delete in Fase 2, so the cached row (if any) is not
-// pruned here. Telegram is the source of truth and a later ListFiles reconcile
-// will drop the stale entry.
+// DeleteFile removes a file's message via fileops.Delete and prunes the cached
+// row from the index, so a subsequent ListFiles no longer serves the deleted
+// file. Pruning happens only after the network delete succeeds; a message that
+// is not cached is a no-op (the index is disposable). Telegram remains the
+// source of truth.
 func (s *driveService) DeleteFile(ctx context.Context, folder dialogs.Folder, msgID int) error {
 	err := s.conn.WithAPI(ctx, func(ctx context.Context, api *tg.Client) error {
 		return fileops.Delete(ctx, api, folder, msgID)
 	})
 	if err != nil {
 		return fmt.Errorf("drive: delete file: %w", err)
+	}
+	f, err := s.ensureFolder(ctx, folder)
+	if err != nil {
+		return err
+	}
+	if err := s.idx.DeleteFile(ctx, f.ID, int64(msgID)); err != nil {
+		return fmt.Errorf("drive: pruning index after delete: %w", err)
 	}
 	return nil
 }
@@ -279,10 +286,9 @@ func (s *driveService) reindexRenamedFile(ctx context.Context, folder dialogs.Fo
 }
 
 // reindexMovedFile mirrors a move into the index by recording the file at its
-// destination (folder+new message id), carrying the cached name/size/MIME over.
-// The source cache entry cannot be pruned (the index exposes no file delete in
-// Fase 2), so it is left as a stale entry until a ListFiles reconcile drops it.
-// A file that is not in the source cache is a no-op success.
+// destination (folder+new message id), carrying the cached name/size/MIME over,
+// and pruning the source cache entry so ListFiles on the origin no longer serves
+// the moved file. A file that is not in the source cache is a no-op success.
 func (s *driveService) reindexMovedFile(ctx context.Context, src dialogs.Folder, msgID int, dst dialogs.Folder, newMsgID int) error {
 	srcFolder, err := s.ensureFolder(ctx, src)
 	if err != nil {
@@ -316,6 +322,9 @@ func (s *driveService) reindexMovedFile(ctx context.Context, src dialogs.Folder,
 		MIME:      moved.MIME,
 	}); err != nil {
 		return fmt.Errorf("drive: updating index after move: %w", err)
+	}
+	if err := s.idx.DeleteFile(ctx, srcFolder.ID, int64(msgID)); err != nil {
+		return fmt.Errorf("drive: pruning source index after move: %w", err)
 	}
 	return nil
 }

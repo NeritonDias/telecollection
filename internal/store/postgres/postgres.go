@@ -52,15 +52,24 @@ func runMigrations(dsn string) error {
 // Ping verifies connectivity.
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
-// CreateFolder inserts a folder and returns it fully populated.
+// CreateFolder inserts a folder or returns the existing row keyed by
+// (tg_account_id, channel_id), returning it fully populated. The upsert makes
+// concurrent creates for the same channel converge on a single row instead of
+// duplicating. CreatedAt is preserved on the conflict path.
 func (s *Store) CreateFolder(ctx context.Context, f store.Folder) (store.Folder, error) {
+	var out store.Folder
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO folders (tg_account_id, channel_id, name) VALUES ($1, $2, $3) RETURNING id, created_at`,
-		f.TGAccountID, f.ChannelID, f.Name).Scan(&f.ID, &f.CreatedAt)
+		`INSERT INTO folders (tg_account_id, channel_id, name)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (tg_account_id, channel_id) DO UPDATE SET
+		   name = EXCLUDED.name
+		 RETURNING id, tg_account_id, channel_id, name, created_at`,
+		f.TGAccountID, f.ChannelID, f.Name).
+		Scan(&out.ID, &out.TGAccountID, &out.ChannelID, &out.Name, &out.CreatedAt)
 	if err != nil {
-		return store.Folder{}, fmt.Errorf("postgres: insert folder: %w", err)
+		return store.Folder{}, fmt.Errorf("postgres: upsert folder: %w", err)
 	}
-	return f, nil
+	return out, nil
 }
 
 // GetFolder returns the folder by ID or store.ErrNotFound.

@@ -168,14 +168,17 @@ func RegisterDriveRoutes(r chi.Router, svc drive.Service) {
 		if name == "" {
 			name = fmt.Sprintf("file-%d", msgID)
 		}
-		// Header values are staged here but not committed until the first write;
-		// if the service fails before writing anything, writeDriveError can still
-		// replace them with a 500 envelope.
+		// Header values are staged here but not committed until the first write.
+		// If the service fails before writing anything, the staged attachment
+		// header must be dropped so the 500 JSON envelope does not go out with a
+		// Content-Disposition attachment (writeJSON overrides Content-Type, but
+		// Content-Disposition would otherwise linger).
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", contentDisposition(name))
 		sw := &streamWriter{w: w}
 		if err := svc.DownloadFile(r.Context(), folder, msgID, sw, nil); err != nil {
 			if !sw.wrote {
+				w.Header().Del("Content-Disposition")
 				writeDriveError(w, err)
 			}
 			return

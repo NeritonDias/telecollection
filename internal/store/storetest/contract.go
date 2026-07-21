@@ -50,6 +50,32 @@ func Contract(t *testing.T, newStore func(t *testing.T) store.Store) {
 		}
 	})
 
+	t.Run("CreateFolderIsIdempotentPerChannel", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		first, err := s.CreateFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 42, Name: "old"})
+		if err != nil {
+			t.Fatalf("CreateFolder(first): %v", err)
+		}
+		second, err := s.CreateFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 42, Name: "new"})
+		if err != nil {
+			t.Fatalf("CreateFolder(second): %v", err)
+		}
+		if second.ID != first.ID {
+			t.Fatalf("re-create of same (account, channel) must reuse row: first=%d second=%d", first.ID, second.ID)
+		}
+		list, err := s.ListFolders(ctx, 1)
+		if err != nil {
+			t.Fatalf("ListFolders: %v", err)
+		}
+		if len(list) != 1 {
+			t.Fatalf("want exactly 1 folder after re-create, got %d", len(list))
+		}
+		if list[0].Name != "new" {
+			t.Fatalf("re-create did not update name: %+v", list[0])
+		}
+	})
+
 	t.Run("ListFoldersFiltersByAccount", func(t *testing.T) {
 		s := newStore(t)
 		ctx := context.Background()

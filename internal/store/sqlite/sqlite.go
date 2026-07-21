@@ -41,17 +41,28 @@ func Open(dsn string) (*Store, error) {
 // Ping verifies connectivity.
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
-// CreateFolder inserts a folder and returns it fully populated.
+// CreateFolder inserts a folder or returns the existing row keyed by
+// (tg_account_id, channel_id), returning it fully populated. The upsert makes
+// concurrent creates for the same channel converge on a single row instead of
+// duplicating. CreatedAt is preserved on the conflict path.
 func (s *Store) CreateFolder(ctx context.Context, f store.Folder) (store.Folder, error) {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO folders (tg_account_id, channel_id, name) VALUES (?, ?, ?)`,
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO folders (tg_account_id, channel_id, name)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(tg_account_id, channel_id) DO UPDATE SET
+		   name = excluded.name`,
 		f.TGAccountID, f.ChannelID, f.Name)
 	if err != nil {
-		return store.Folder{}, fmt.Errorf("sqlite: insert folder: %w", err)
+		return store.Folder{}, fmt.Errorf("sqlite: upsert folder: %w", err)
 	}
-	id, err := res.LastInsertId()
+	// last_insert_rowid is unreliable on the DO UPDATE path, so resolve the id
+	// by the unique key.
+	var id int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM folders WHERE tg_account_id = ? AND channel_id = ?`, f.TGAccountID, f.ChannelID).
+		Scan(&id)
 	if err != nil {
-		return store.Folder{}, fmt.Errorf("sqlite: last insert id: %w", err)
+		return store.Folder{}, fmt.Errorf("sqlite: resolve upserted folder id: %w", err)
 	}
 	return s.GetFolder(ctx, id)
 }
