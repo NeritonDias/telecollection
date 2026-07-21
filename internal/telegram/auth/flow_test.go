@@ -54,7 +54,7 @@ func (b *fakeBackend) RunAuth(ctx context.Context, a tgauth.UserAuthenticator) e
 	return b.finalErr
 }
 
-func (b *fakeBackend) ExportQR(ctx context.Context) (string, error) {
+func (b *fakeBackend) ExportQR(_ context.Context) (string, error) {
 	return b.qrURL, b.qrErr
 }
 
