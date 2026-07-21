@@ -1,0 +1,24 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # suspicious constructs
+    - ineffassign   # ineffective assignments
+    - staticcheck   # broad static analysis
+    - unused        # dead code
+    - gosec         # security issues (required — security is a project constraint)
+    - revive        # style/lint
+    - misspell      # typos in comments/strings
+    - gofmt         # formatting
+    - goimports     # import grouping/ordering
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Test files may use weaker rng / ignore some errors deliberately.
+    - path: _test\.go
+      linters: [gosec, errcheck]

@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Portable build + tests across the three desktop targets.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  # Race detector needs cgo/gcc — run it on Linux where the toolchain is present.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - run: go test -race ./...
+        env:
+          CGO_ENABLED: '1'
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8 # pinned to v1 to match the v1-schema .golangci.yml
+
+  # Postgres contract test against a real service container.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tc
+          POSTGRES_PASSWORD: tc
+          POSTGRES_DB: tc
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U tc"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - run: go test ./internal/store/postgres/... ./internal/store/migrate/...
+        env:
+          TELECOL_TEST_PG_DSN: postgres://tc:tc@localhost:5432/tc?sslmode=disable
+
+# NOTE (phase 7 — desktop packaging): a macOS job will add codesign + notarization:
+#   xcrun notarytool submit ... && xcrun stapler staple ...
+# using secrets MACOS_CERT (base64 Developer ID) and NOTARY_KEY (.p8). Wired when
+# the Wails desktop build lands, not in the foundation.

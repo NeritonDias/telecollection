@@ -1,0 +1,42 @@
+version: '3'
+
+# Task runner for TeleCollection. Install: https://taskfile.dev
+# Fallback: run the underlying `go`/`golangci-lint` commands directly.
+
+tasks:
+  test:
+    desc: Run all tests (portable — no cgo required).
+    cmds: ['go test ./...']
+
+  test:race:
+    desc: Run tests with the race detector (requires cgo/gcc; runs in CI on Linux/macOS).
+    cmds: ['go test -race ./...']
+    env: { CGO_ENABLED: '1' }
+
+  lint:
+    desc: Run golangci-lint.
+    cmds: ['golangci-lint run']
+
+  build:
+    desc: Build all commands for the current OS into ./bin.
+    cmds: ['go build -o bin/ ./cmd/...']
+
+  vet:
+    cmds: ['go vet ./...']
+
+  check:
+    desc: Local gate — vet, lint, test, build. Must be green before DONE.
+    deps: [vet, test]
+    cmds:
+      - go build ./...
+
+  cross:
+    desc: Cross-compile the daemon for the release matrix.
+    cmds:
+      - GOOS=windows GOARCH=amd64 go build -o bin/windows/ ./cmd/...
+      - GOOS=linux   GOARCH=amd64 go build -o bin/linux/ ./cmd/...
+      - GOOS=darwin  GOARCH=arm64 go build -o bin/macos/ ./cmd/...
+
+  run:
+    desc: Run the daemon (server mode).
+    cmds: ['go run ./cmd/telecollectiond']

@@ -1,0 +1,47 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test / coverage
+*.test
+*.out
+coverage.*
+
+# Go workspace
+go.work
+go.work.sum
+
+# Local data / secrets
+*.db
+*.db-wal
+*.db-shm
+*.session
+*.session-*
+/data/
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Wails / frontend build
+/web/dist/
+/web/node_modules/
+/build/bin/
+
+# macOS signing
+*.p12
+*.provisionprofile
+
+# Internal planning & agent docs — NOT part of the public repo
+/AGENTS.md
+/PROGRESSO.md
+/docs/
