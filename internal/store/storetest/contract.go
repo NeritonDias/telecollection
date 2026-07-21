@@ -67,4 +67,132 @@ func Contract(t *testing.T, newStore func(t *testing.T) store.Store) {
 			t.Fatalf("ListFolders(1) = %+v, want exactly folder A", got)
 		}
 	})
+
+	t.Run("UpsertAndGetFile", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		folder, err := s.CreateFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 10, Name: "F"})
+		if err != nil {
+			t.Fatalf("CreateFolder: %v", err)
+		}
+		created, err := s.UpsertFile(ctx, store.File{
+			FolderID: folder.ID, MessageID: 500, Name: "a.pdf", Size: 1234, MIME: "application/pdf",
+		})
+		if err != nil {
+			t.Fatalf("UpsertFile: %v", err)
+		}
+		if created.ID == 0 {
+			t.Fatal("UpsertFile must assign a non-zero ID")
+		}
+		if created.CreatedAt.IsZero() {
+			t.Fatal("UpsertFile must populate CreatedAt")
+		}
+		got, err := s.GetFile(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("GetFile: %v", err)
+		}
+		if got.MessageID != 500 || got.Name != "a.pdf" || got.Size != 1234 || got.MIME != "application/pdf" {
+			t.Fatalf("GetFile returned %+v, want msg=500 name=a.pdf size=1234 mime=application/pdf", got)
+		}
+	})
+
+	t.Run("UpsertFileIsIdempotentPerMessage", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		folder, err := s.CreateFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 10, Name: "F"})
+		if err != nil {
+			t.Fatalf("CreateFolder: %v", err)
+		}
+		first, err := s.UpsertFile(ctx, store.File{
+			FolderID: folder.ID, MessageID: 7, Name: "old.txt", Size: 1, MIME: "text/plain",
+		})
+		if err != nil {
+			t.Fatalf("UpsertFile(first): %v", err)
+		}
+		second, err := s.UpsertFile(ctx, store.File{
+			FolderID: folder.ID, MessageID: 7, Name: "new.txt", Size: 2, MIME: "text/markdown",
+		})
+		if err != nil {
+			t.Fatalf("UpsertFile(second): %v", err)
+		}
+		if second.ID != first.ID {
+			t.Fatalf("re-upsert of same (folder, message) must reuse row: first=%d second=%d", first.ID, second.ID)
+		}
+		list, err := s.ListFiles(ctx, folder.ID)
+		if err != nil {
+			t.Fatalf("ListFiles: %v", err)
+		}
+		if len(list) != 1 {
+			t.Fatalf("want exactly 1 file after re-upsert, got %d", len(list))
+		}
+		if list[0].Name != "new.txt" || list[0].Size != 2 || list[0].MIME != "text/markdown" {
+			t.Fatalf("re-upsert did not update fields: %+v", list[0])
+		}
+	})
+
+	t.Run("ListFilesFiltersByFolder", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		f1, err := s.CreateFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 1, Name: "A"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f2, err := s.CreateFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 2, Name: "B"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.UpsertFile(ctx, store.File{FolderID: f1.ID, MessageID: 1, Name: "x", Size: 1, MIME: "text/plain"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.UpsertFile(ctx, store.File{FolderID: f1.ID, MessageID: 2, Name: "y", Size: 1, MIME: "text/plain"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.UpsertFile(ctx, store.File{FolderID: f2.ID, MessageID: 3, Name: "z", Size: 1, MIME: "text/plain"}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.ListFiles(ctx, f1.ID)
+		if err != nil {
+			t.Fatalf("ListFiles: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("ListFiles(f1) = %d files, want 2", len(got))
+		}
+		for _, f := range got {
+			if f.FolderID != f1.ID {
+				t.Fatalf("ListFiles(f1) leaked file from folder %d", f.FolderID)
+			}
+		}
+	})
+
+	t.Run("GetFileNotFound", func(t *testing.T) {
+		s := newStore(t)
+		_, err := s.GetFile(context.Background(), 987654)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("GetFile(missing) error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("DeleteFile", func(t *testing.T) {
+		s := newStore(t)
+		ctx := context.Background()
+		folder, err := s.CreateFolder(ctx, store.Folder{TGAccountID: 1, ChannelID: 10, Name: "F"})
+		if err != nil {
+			t.Fatalf("CreateFolder: %v", err)
+		}
+		created, err := s.UpsertFile(ctx, store.File{
+			FolderID: folder.ID, MessageID: 42, Name: "gone.bin", Size: 9, MIME: "application/octet-stream",
+		})
+		if err != nil {
+			t.Fatalf("UpsertFile: %v", err)
+		}
+		if err := s.DeleteFile(ctx, created.ID); err != nil {
+			t.Fatalf("DeleteFile: %v", err)
+		}
+		if _, err := s.GetFile(ctx, created.ID); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("GetFile after delete = %v, want ErrNotFound", err)
+		}
+		if err := s.DeleteFile(ctx, created.ID); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("DeleteFile(missing) = %v, want ErrNotFound", err)
+		}
+	})
 }

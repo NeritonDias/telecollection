@@ -24,7 +24,7 @@ func TestPostgres_Contract(t *testing.T) {
 			t.Fatalf("Open: %v", err)
 		}
 		// Fresh state per subtest (single shared DB).
-		if _, err := s.pool.Exec(ctx, "TRUNCATE folders RESTART IDENTITY"); err != nil {
+		if _, err := s.pool.Exec(ctx, "TRUNCATE files, folders RESTART IDENTITY"); err != nil {
 			t.Fatalf("truncate: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Close() })

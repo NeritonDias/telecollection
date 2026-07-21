@@ -30,6 +30,16 @@ type Store interface {
 	// ListFolders returns folders for a Telegram account.
 	ListFolders(ctx context.Context, tgAccountID int64) ([]Folder, error)
 
+	// UpsertFile inserts a file or updates the existing one keyed by
+	// (folder_id, message_id), returning it with ID/CreatedAt populated.
+	UpsertFile(ctx context.Context, f File) (File, error)
+	// GetFile returns the file by ID, or ErrNotFound.
+	GetFile(ctx context.Context, id int64) (File, error)
+	// ListFiles returns files for a folder, ordered by ID.
+	ListFiles(ctx context.Context, folderID int64) ([]File, error)
+	// DeleteFile removes a file by ID, or returns ErrNotFound.
+	DeleteFile(ctx context.Context, id int64) error
+
 	// Close releases underlying resources.
 	Close() error
 }
