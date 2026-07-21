@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,15 +26,19 @@ var _ tgauth.UserAuthenticator = (*flowAuthenticator)(nil)
 
 // fakeBackend stands in for the real gotd login backend. It drives the
 // UserAuthenticator exactly the way gotd's Flow does (Phone, then Code, then
-// Password only if 2FA is required), so the real channel wiring and state
-// machine are exercised without any network I/O or credentials.
+// Password only if 2FA is required), and mirrors qrlogin.QR.Auth for RunQR
+// (publish the token URL, then block until a scan is signalled), so the real
+// channel wiring and state machine are exercised without any network I/O or
+// credentials.
 type fakeBackend struct {
 	need2FA  bool
 	finalErr error // returned after the flow "completes"
 
-	qrURL   string
-	qrErr   error
-	authErr error // returned immediately, before requesting a code
+	qrURL     string
+	qrErr     error         // returned immediately from RunQR, before any token URL
+	qrScan    chan struct{} // when closed, RunQR "completes" (the phone scanned)
+	qrScanErr error         // terminal error RunQR returns once qrScan fires
+	authErr   error         // returned immediately, before requesting a code
 }
 
 func (b *fakeBackend) RunAuth(ctx context.Context, a tgauth.UserAuthenticator) error {
@@ -54,8 +59,61 @@ func (b *fakeBackend) RunAuth(ctx context.Context, a tgauth.UserAuthenticator) e
 	return b.finalErr
 }
 
-func (b *fakeBackend) ExportQR(_ context.Context) (string, error) {
-	return b.qrURL, b.qrErr
+func (b *fakeBackend) RunQR(ctx context.Context, onToken func(url string)) error {
+	if b.qrErr != nil {
+		return b.qrErr
+	}
+	onToken(b.qrURL)
+	// Mirror qrlogin.QR.Auth: show the token, then await the scan. A nil qrScan
+	// blocks forever, so the flow only ends via ctx cancellation (preempt /
+	// Logout) — this keeps StartQR's URL return deterministic (done never races
+	// with urlCh) and lets tests drive completion explicitly.
+	select {
+	case <-b.qrScan:
+		return b.qrScanErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// gatedBackend is a code-login backend whose progress past the code step is
+// controlled by the test, so a request context can be cancelled at a precise
+// moment mid-flight.
+type gatedBackend struct {
+	need2FA  bool
+	codeSeen chan struct{} // signalled once, after Code delivers its value
+	gate     chan struct{} // the flow blocks here until the test releases it
+	finalErr error
+}
+
+func (b *gatedBackend) RunAuth(ctx context.Context, a tgauth.UserAuthenticator) error {
+	if _, err := a.Phone(ctx); err != nil {
+		return err
+	}
+	if _, err := a.Code(ctx, nil); err != nil {
+		return err
+	}
+	if b.codeSeen != nil {
+		close(b.codeSeen)
+	}
+	if b.gate != nil {
+		select {
+		case <-b.gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if b.need2FA {
+		if _, err := a.Password(ctx); err != nil {
+			return err
+		}
+	}
+	return b.finalErr
+}
+
+func (b *gatedBackend) RunQR(ctx context.Context, _ func(url string)) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 // waitState polls until the service reaches want or the deadline elapses.
@@ -129,7 +187,7 @@ func TestSubmitPassword_NoLoginInProgress(t *testing.T) {
 	}
 }
 
-// --- happy path (no 2FA) ---------------------------------------------------
+// --- happy path (no 2FA): state is driven by the flow goroutine ------------
 
 func TestLogin_CodeOnly(t *testing.T) {
 	s := newService(&fakeBackend{need2FA: false})
@@ -137,6 +195,8 @@ func TestLogin_CodeOnly(t *testing.T) {
 	if err := s.StartLogin(context.Background(), "+15551234567"); err != nil {
 		t.Fatalf("StartLogin: %v", err)
 	}
+	// StateWaitCode was set by the authenticator's Code method (the goroutine),
+	// not by StartLogin itself.
 	if got, _ := s.Status(context.Background()); got != StateWaitCode {
 		t.Fatalf("after StartLogin state = %q, want %q", got, StateWaitCode)
 	}
@@ -149,7 +209,7 @@ func TestLogin_CodeOnly(t *testing.T) {
 	}
 }
 
-// --- 2FA path --------------------------------------------------------------
+// --- 2FA path: state is driven by the flow goroutine -----------------------
 
 func TestLogin_With2FA(t *testing.T) {
 	s := newService(&fakeBackend{need2FA: true})
@@ -163,6 +223,7 @@ func TestLogin_With2FA(t *testing.T) {
 	if !errors.Is(err, ErrPasswordNeeded) {
 		t.Fatalf("SubmitCode with 2FA: got err %v, want ErrPasswordNeeded", err)
 	}
+	// StateWaitPassword was set by the authenticator's Password method.
 	if got, _ := s.Status(context.Background()); got != StateWaitPassword {
 		t.Fatalf("after 2FA SubmitCode state = %q, want %q", got, StateWaitPassword)
 	}
@@ -198,8 +259,7 @@ func TestLogin_CodeRejected(t *testing.T) {
 func TestStartLogin_AlreadyAuthorized(t *testing.T) {
 	// Backend returns nil before requesting a code: gotd's IfNecessary does this
 	// when the stored session is already authorized.
-	s := newService(&fakeBackend{authErr: nil, qrURL: ""})
-	s.backend = &alreadyAuthorizedBackend{}
+	s := newService(&alreadyAuthorizedBackend{})
 
 	if err := s.StartLogin(context.Background(), "+15551234567"); err != nil {
 		t.Fatalf("StartLogin (already authorized): %v", err)
@@ -216,9 +276,50 @@ type alreadyAuthorizedBackend struct{}
 func (alreadyAuthorizedBackend) RunAuth(context.Context, tgauth.UserAuthenticator) error {
 	return nil
 }
-func (alreadyAuthorizedBackend) ExportQR(context.Context) (string, error) { return "", nil }
+func (alreadyAuthorizedBackend) RunQR(context.Context, func(string)) error { return nil }
 
-// --- double start ----------------------------------------------------------
+// --- double start: concurrent StartLogin -----------------------------------
+
+// Two concurrent StartLogin calls must resolve to exactly one success and one
+// "in progress" rejection — never two winners, never a corrupted machine. Run
+// under -count=N to shake out the StartLogin-vs-StartLogin race.
+func TestStartLogin_ConcurrentExactlyOneWins(t *testing.T) {
+	s := newService(&fakeBackend{need2FA: true})
+
+	const n = 2
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- s.StartLogin(context.Background(), "+15551234567")
+		}()
+	}
+	close(start) // release both as simultaneously as possible
+	wg.Wait()
+	close(errs)
+
+	var wins, inProgress int
+	for err := range errs {
+		switch {
+		case err == nil:
+			wins++
+		case errors.Is(err, errLoginInProgress):
+			inProgress++
+		default:
+			t.Fatalf("unexpected StartLogin error: %v", err)
+		}
+	}
+	if wins != 1 || inProgress != 1 {
+		t.Fatalf("concurrent StartLogin: wins=%d inProgress=%d, want 1 and 1", wins, inProgress)
+	}
+	// The winner reached StateWaitCode; the machine is coherent.
+	waitState(t, s, StateWaitCode)
+	_ = s.Logout(context.Background())
+}
 
 func TestStartLogin_AlreadyInProgress(t *testing.T) {
 	s := newService(&fakeBackend{need2FA: true})
@@ -231,12 +332,59 @@ func TestStartLogin_AlreadyInProgress(t *testing.T) {
 	if err := s.StartLogin(context.Background(), "+15559999999"); err == nil {
 		t.Fatal("second StartLogin while in progress: expected error, got nil")
 	}
+	_ = s.Logout(context.Background())
+}
+
+// --- ctx cancelled mid-flight must not desynchronise the machine -----------
+
+// If a request context is cancelled after the code was delivered but before the
+// flow's next step is observed, SubmitCode must return promptly AND leave the
+// machine recoverable: the flow goroutine still owns the state, so a subsequent
+// SubmitPassword completes the login rather than deadlocking.
+func TestSubmitCode_CtxCancelMidFlightRecovers(t *testing.T) {
+	b := &gatedBackend{
+		need2FA:  true,
+		codeSeen: make(chan struct{}),
+		gate:     make(chan struct{}),
+	}
+	s := newService(b)
+
+	if err := s.StartLogin(context.Background(), "+15551234567"); err != nil {
+		t.Fatalf("StartLogin: %v", err)
+	}
+	waitState(t, s, StateWaitCode)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	subErr := make(chan error, 1)
+	go func() { subErr <- s.SubmitCode(ctx, "12345") }()
+
+	<-b.codeSeen // the flow received the code; it is now blocked on the gate
+	cancel()     // caller's request context dies mid-flight
+
+	select {
+	case err := <-subErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("SubmitCode after ctx cancel: got %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SubmitCode did not return after its ctx was cancelled")
+	}
+
+	// Release the flow; the goroutine (sole state owner) advances to 2FA.
+	close(b.gate)
+	waitState(t, s, StateWaitPassword)
+
+	// A subsequent SubmitPassword must not deadlock and must finish the login.
+	if err := s.SubmitPassword(context.Background(), "hunter2"); err != nil {
+		t.Fatalf("SubmitPassword after recovery: %v", err)
+	}
+	waitState(t, s, StateLoggedIn)
 }
 
 // --- authenticator behaviour ----------------------------------------------
 
 func TestFlowAuthenticator_Phone(t *testing.T) {
-	a := newFlowAuthenticator("+15551234567")
+	a := newFlowAuthenticator("+15551234567", func() {}, func() {})
 	phone, err := a.Phone(context.Background())
 	if err != nil {
 		t.Fatalf("Phone: %v", err)
@@ -247,14 +395,14 @@ func TestFlowAuthenticator_Phone(t *testing.T) {
 }
 
 func TestFlowAuthenticator_SignUpRejected(t *testing.T) {
-	a := newFlowAuthenticator("+15551234567")
+	a := newFlowAuthenticator("+15551234567", func() {}, func() {})
 	if _, err := a.SignUp(context.Background()); err == nil {
 		t.Fatal("SignUp: expected error (sign up unsupported), got nil")
 	}
 }
 
 func TestFlowAuthenticator_CodeHonoursContext(t *testing.T) {
-	a := newFlowAuthenticator("+15551234567")
+	a := newFlowAuthenticator("+15551234567", func() {}, func() {})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := a.Code(ctx, nil); err == nil {
@@ -267,6 +415,7 @@ func TestFlowAuthenticator_CodeHonoursContext(t *testing.T) {
 func TestStartQR_ReturnsURL(t *testing.T) {
 	const want = "tg://login?token=abcdef"
 	s := newService(&fakeBackend{qrURL: want})
+
 	got, err := s.StartQR(context.Background())
 	if err != nil {
 		t.Fatalf("StartQR: %v", err)
@@ -274,6 +423,8 @@ func TestStartQR_ReturnsURL(t *testing.T) {
 	if got != want {
 		t.Fatalf("StartQR URL = %q, want %q", got, want)
 	}
+	// The QR goroutine is still awaiting a scan; Logout tears it down cleanly.
+	_ = s.Logout(context.Background())
 }
 
 func TestStartQR_BackendError(t *testing.T) {
@@ -281,6 +432,54 @@ func TestStartQR_BackendError(t *testing.T) {
 	if _, err := s.StartQR(context.Background()); err == nil {
 		t.Fatal("StartQR with backend error: expected error, got nil")
 	}
+	if got, _ := s.Status(context.Background()); got != StateLoggedOut {
+		t.Fatalf("after QR error state = %q, want %q", got, StateLoggedOut)
+	}
+}
+
+// StartQR completes: once the phone scans, the flow goroutine transitions to
+// StateLoggedIn on its own.
+func TestStartQR_CompletesToLoggedIn(t *testing.T) {
+	scan := make(chan struct{})
+	s := newService(&fakeBackend{qrURL: "tg://login?token=abc", qrScan: scan})
+
+	if _, err := s.StartQR(context.Background()); err != nil {
+		t.Fatalf("StartQR: %v", err)
+	}
+	if got, _ := s.Status(context.Background()); got == StateLoggedIn {
+		t.Fatal("logged in before the scan was signalled")
+	}
+
+	close(scan) // the phone scanned the code
+	waitState(t, s, StateLoggedIn)
+}
+
+// StartQR during a pending code login preempts it (fallback code -> QR) without
+// a reentrant Run, then completes to StateLoggedIn on scan.
+func TestStartQR_PreemptsPendingCodeLogin(t *testing.T) {
+	scan := make(chan struct{})
+	s := newService(&fakeBackend{need2FA: true, qrURL: "tg://login?token=xyz", qrScan: scan})
+
+	if err := s.StartLogin(context.Background(), "+15551234567"); err != nil {
+		t.Fatalf("StartLogin: %v", err)
+	}
+	waitState(t, s, StateWaitCode)
+
+	url, err := s.StartQR(context.Background())
+	if err != nil {
+		t.Fatalf("StartQR (preempting code login): %v", err)
+	}
+	if url != "tg://login?token=xyz" {
+		t.Fatalf("StartQR URL = %q, want tg://login?token=xyz", url)
+	}
+
+	// The preempted code login must no longer be accepting a code.
+	if err := s.SubmitCode(context.Background(), "12345"); err == nil {
+		t.Fatal("SubmitCode after QR preemption: expected error, got nil")
+	}
+
+	close(scan)
+	waitState(t, s, StateLoggedIn)
 }
 
 // --- logout ----------------------------------------------------------------
@@ -300,7 +499,7 @@ func TestLogout_ResetsState(t *testing.T) {
 	}
 }
 
-// --- production wiring (documents the 1.4 integration gap) ------------------
+// --- production wiring (documents the 1.4 integration) ----------------------
 
 // The real client backend built by NewService is constructed correctly and
 // starts in the logged-out state. Its network-driven StartLogin/StartQR paths

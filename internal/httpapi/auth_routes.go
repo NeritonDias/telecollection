@@ -32,7 +32,11 @@ func RegisterAuthRoutes(r chi.Router, svc auth.Service) {
 			writeServiceError(w, err)
 			return
 		}
-		writeState(w, auth.StateWaitCode)
+		// StartLogin returns nil both when a code is awaited and when a valid
+		// session already made the login unnecessary. Report the real state so a
+		// returning (already-authorized) user isn't told to enter a code.
+		st, _ := svc.Status(r.Context())
+		writeState(w, st)
 	})
 
 	r.Post("/auth/code", func(w http.ResponseWriter, r *http.Request) {

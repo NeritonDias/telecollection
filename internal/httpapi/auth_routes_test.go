@@ -14,14 +14,15 @@ import (
 
 // fakeService is a configurable auth.Service double for testing the HTTP layer.
 type fakeService struct {
-	startErr    error
-	codeErr     error
-	passwordErr error
-	qrURL       string
-	qrErr       error
-	state       auth.State
-	statusErr   error
-	logoutErr   error
+	startErr        error
+	codeErr         error
+	passwordErr     error
+	qrURL           string
+	qrErr           error
+	state           auth.State
+	stateAfterStart auth.State // what Status reports after a successful StartLogin
+	statusErr       error
+	logoutErr       error
 
 	gotPhone    string
 	gotCode     string
@@ -30,7 +31,17 @@ type fakeService struct {
 
 func (f *fakeService) StartLogin(_ context.Context, phone string) error {
 	f.gotPhone = phone
-	return f.startErr
+	if f.startErr != nil {
+		return f.startErr
+	}
+	// Mirror the real service: a successful StartLogin leaves Status reporting
+	// StateWaitCode, unless the test simulates an already-authorized session.
+	if f.stateAfterStart != "" {
+		f.state = f.stateAfterStart
+	} else {
+		f.state = auth.StateWaitCode
+	}
+	return nil
 }
 
 func (f *fakeService) SubmitCode(_ context.Context, code string) error {
@@ -146,6 +157,21 @@ func TestAuthQR_ReturnsQRURL(t *testing.T) {
 	}
 	if out.QRURL != url {
 		t.Fatalf("qr_url = %q, want %q", out.QRURL, url)
+	}
+}
+
+func TestAuthStart_AlreadyAuthorizedReportsLoggedIn(t *testing.T) {
+	// Returning user with a valid session: StartLogin succeeds but the real state
+	// is logged_in — the handler must report that, not tell them to enter a code
+	// (regression guard for review finding #2).
+	f := &fakeService{stateAfterStart: auth.StateLoggedIn}
+	rec := doJSON(t, mountAuth(f), http.MethodPost, "/auth/start", `{"phone":"+5562999999999"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if s := decodeState(t, rec); s != string(auth.StateLoggedIn) {
+		t.Fatalf("state = %q, want %q", s, auth.StateLoggedIn)
 	}
 }
 
