@@ -11,6 +11,7 @@ virtual drive on your desktop. Self‑hosted or fully local. Open source.
 ![CI](https://github.com/NeritonDias/telecollection/actions/workflows/ci.yml/badge.svg)
 ![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-early%20development-orange)
 
 </div>
@@ -105,7 +106,7 @@ The project follows TDD with a cross‑platform CI gate (`go vet`, lint, race te
 
 ## License
 
-To be finalized (MIT or AGPL‑3.0). Open source; donations unlock multi‑account.
+[MIT](LICENSE) © Neriton Dias. Open source; donations unlock multi‑account.
 
 ---
 
