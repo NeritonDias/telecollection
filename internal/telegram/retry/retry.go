@@ -27,20 +27,20 @@ type Policy struct {
 // attempt: base * 2^attempt, capped at max. attempt starts at 0, so attempt 0
 // yields base, attempt 1 yields 2*base, and so on. It carries no jitter.
 // Negative attempts are treated as 0.
-func Backoff(attempt int, base, max time.Duration) time.Duration {
+func Backoff(attempt int, base, maxDelay time.Duration) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
 	d := base
 	for i := 0; i < attempt; i++ {
 		// Cap early to avoid time.Duration (int64) overflow on large attempts.
-		if d >= max {
-			return max
+		if d >= maxDelay {
+			return maxDelay
 		}
 		d *= 2
 	}
-	if d > max {
-		return max
+	if d > maxDelay {
+		return maxDelay
 	}
 	return d
 }

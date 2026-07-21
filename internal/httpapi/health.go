@@ -17,7 +17,7 @@ type healthResponse struct {
 
 // Health responds with service liveness and version. No authentication required —
 // this is the only unauthenticated endpoint (mirrors the REST API contract).
-func Health(w http.ResponseWriter, r *http.Request) {
+func Health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(healthResponse{

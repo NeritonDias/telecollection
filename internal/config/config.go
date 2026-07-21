@@ -15,6 +15,7 @@ import (
 // self-hosted daemon.
 type Mode string
 
+// Supported run modes.
 const (
 	ModeDesktop Mode = "desktop"
 	ModeServer  Mode = "server"

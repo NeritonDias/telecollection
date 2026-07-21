@@ -12,7 +12,7 @@ import (
 
 func TestBackoffGrowsAndSaturates(t *testing.T) {
 	base := 1 * time.Second
-	max := 10 * time.Second
+	maxDelay := 10 * time.Second
 
 	cases := []struct {
 		attempt int
@@ -27,16 +27,16 @@ func TestBackoffGrowsAndSaturates(t *testing.T) {
 		{40, 10 * time.Second}, // no overflow, stays capped
 	}
 	for _, c := range cases {
-		if got := Backoff(c.attempt, base, max); got != c.want {
-			t.Errorf("Backoff(%d, %v, %v) = %v, want %v", c.attempt, base, max, got, c.want)
+		if got := Backoff(c.attempt, base, maxDelay); got != c.want {
+			t.Errorf("Backoff(%d, %v, %v) = %v, want %v", c.attempt, base, maxDelay, got, c.want)
 		}
 	}
 }
 
 func TestBackoffNegativeAttempt(t *testing.T) {
 	base := 500 * time.Millisecond
-	max := 5 * time.Second
-	if got := Backoff(-3, base, max); got != base {
+	maxDelay := 5 * time.Second
+	if got := Backoff(-3, base, maxDelay); got != base {
 		t.Errorf("Backoff(-3, ...) = %v, want %v", got, base)
 	}
 }

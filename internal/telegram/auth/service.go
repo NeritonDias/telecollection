@@ -11,6 +11,7 @@ import (
 // State reflects where the login flow currently is.
 type State string
 
+// Login flow states.
 const (
 	StateLoggedOut    State = "logged_out"
 	StateWaitCode     State = "wait_code"

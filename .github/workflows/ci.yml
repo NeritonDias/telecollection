@@ -46,7 +46,7 @@ jobs:
           go-version: '1.26'
       - uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.64.8 # pinned to v1 to match the v1-schema .golangci.yml
+          version: v2.12.2 # v2 built with Go >=1.25 (deps require it); validated locally
 
   # Postgres contract test against a real service container.
   postgres:

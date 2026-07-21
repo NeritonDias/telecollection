@@ -111,7 +111,7 @@ func TestRun_CancelledContext(t *testing.T) {
 	var callbackRan atomic.Bool
 	done := make(chan error, 1)
 	go func() {
-		done <- c.Run(ctx, func(ctx context.Context) error {
+		done <- c.Run(ctx, func(_ context.Context) error {
 			callbackRan.Store(true)
 			return errors.New("callback must not run on a cancelled context")
 		})
